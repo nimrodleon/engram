@@ -435,12 +435,15 @@ func upsertDashboardPrompt(prompts map[string]DashboardPromptRow, syncID, projec
 }
 
 type dashboardSessionMutationPayload struct {
-	ID        string `json:"id"`
-	Project   string `json:"project"`
-	StartedAt string `json:"started_at,omitempty"`
-	EndedAt   string `json:"ended_at,omitempty"`
-	Summary   string `json:"summary,omitempty"`
-	Directory string `json:"directory,omitempty"`
+	ID         string  `json:"id"`
+	Project    string  `json:"project"`
+	StartedAt  string  `json:"started_at,omitempty"`
+	EndedAt    string  `json:"ended_at,omitempty"`
+	Summary    string  `json:"summary,omitempty"`
+	Directory  string  `json:"directory,omitempty"`
+	Deleted    bool    `json:"deleted,omitempty"`
+	DeletedAt  *string `json:"deleted_at,omitempty"`
+	HardDelete bool    `json:"hard_delete,omitempty"`
 }
 
 type dashboardObservationMutationPayload struct {
@@ -485,7 +488,7 @@ func applyDashboardMutation(
 			return err
 		}
 		key := resolveProjectValue(entityKey, body.ID)
-		if op == store.SyncOpDelete {
+		if op == store.SyncOpDelete || body.Deleted || body.HardDelete || (body.DeletedAt != nil && strings.TrimSpace(*body.DeletedAt) != "") {
 			delete(sessions, strings.TrimSpace(key))
 			return nil
 		}

@@ -121,7 +121,9 @@ func collectSessionMutationKeys(entries any) (map[string]struct{}, error) {
 		}
 		entity, _ := row["entity"].(string)
 		op, _ := row["op"].(string)
-		if strings.TrimSpace(entity) != store.SyncEntitySession || strings.TrimSpace(op) != store.SyncOpUpsert {
+		trimmedEntity := strings.TrimSpace(entity)
+		trimmedOp := strings.TrimSpace(op)
+		if trimmedEntity != store.SyncEntitySession || (trimmedOp != store.SyncOpUpsert && trimmedOp != store.SyncOpDelete) {
 			continue
 		}
 		entityKey, _ := row["entity_key"].(string)
@@ -216,12 +218,15 @@ func collectRequiredSessionKeys(doc map[string]any, mutationEntries any) (map[st
 }
 
 type mutationSessionPayload struct {
-	ID        string  `json:"id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	StartedAt string  `json:"started_at,omitempty"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
+	ID         string  `json:"id"`
+	Project    string  `json:"project"`
+	Directory  string  `json:"directory,omitempty"`
+	StartedAt  string  `json:"started_at,omitempty"`
+	EndedAt    *string `json:"ended_at,omitempty"`
+	Summary    *string `json:"summary,omitempty"`
+	Deleted    bool    `json:"deleted,omitempty"`
+	DeletedAt  *string `json:"deleted_at,omitempty"`
+	HardDelete bool    `json:"hard_delete,omitempty"`
 }
 
 type mutationObservationPayload struct {
@@ -307,7 +312,7 @@ func normalizeChunkMutation(raw map[string]any, project string) (map[string]any,
 func validateSupportedMutation(entity, op string) error {
 	switch entity {
 	case store.SyncEntitySession:
-		if op != store.SyncOpUpsert {
+		if op != store.SyncOpUpsert && op != store.SyncOpDelete {
 			return fmt.Errorf("unsupported mutation %q/%q", entity, op)
 		}
 		return nil
@@ -333,8 +338,22 @@ func normalizeMutationPayload(entity, op, payload, project string) (normalizedPa
 		if body.ID == "" {
 			return "", "", fmt.Errorf("session payload id is required")
 		}
-		if body.Directory == "" {
+		if op == store.SyncOpUpsert && body.Directory == "" {
 			return "", "", fmt.Errorf("session payload directory is required for upsert")
+		}
+		if op == store.SyncOpDelete {
+			body.Directory = ""
+			body.StartedAt = ""
+			body.EndedAt = nil
+			body.Summary = nil
+			if body.DeletedAt != nil {
+				trimmed := strings.TrimSpace(*body.DeletedAt)
+				if trimmed == "" {
+					body.DeletedAt = nil
+				} else {
+					body.DeletedAt = &trimmed
+				}
+			}
 		}
 		body.Project = project
 		encoded, err := json.Marshal(body)

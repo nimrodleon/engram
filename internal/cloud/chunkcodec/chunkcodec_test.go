@@ -199,3 +199,52 @@ func TestCanonicalizeForProjectDerivesSessionOwnershipFromPayloadIDWhenEntityKey
 		t.Fatalf("expected canonicalized mutation entity_key to be derived from payload id, got %q", decoded.Mutations[0].EntityKey)
 	}
 }
+
+func TestCanonicalizeForProjectAcceptsSessionDeleteMutation(t *testing.T) {
+	raw := []byte(`{
+		"mutations": [
+			{
+				"entity": "session",
+				"op": "delete",
+				"project": "wrong",
+				"payload": "{\"id\":\"sess-delete\",\"project\":\"wrong\",\"deleted_at\":\"2026-04-26T12:00:00Z\"}"
+			}
+		]
+	}`)
+
+	normalized, err := CanonicalizeForProject(raw, "proj-a")
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+
+	var chunk struct {
+		Mutations []store.SyncMutation `json:"mutations"`
+	}
+	if err := json.Unmarshal(normalized, &chunk); err != nil {
+		t.Fatalf("decode canonicalized chunk: %v", err)
+	}
+	if len(chunk.Mutations) != 1 {
+		t.Fatalf("expected 1 mutation, got %d", len(chunk.Mutations))
+	}
+	mutation := chunk.Mutations[0]
+	if mutation.Entity != store.SyncEntitySession || mutation.Op != store.SyncOpDelete || mutation.EntityKey != "sess-delete" {
+		t.Fatalf("expected canonical session/delete mutation, got %+v", mutation)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(mutation.Payload), &payload); err != nil {
+		t.Fatalf("decode canonical payload: %v", err)
+	}
+	if payload["id"] != "sess-delete" {
+		t.Fatalf("expected payload id sess-delete, got %#v", payload["id"])
+	}
+	if payload["project"] != "proj-a" {
+		t.Fatalf("expected payload project rewritten to proj-a, got %#v", payload["project"])
+	}
+	if payload["deleted_at"] != "2026-04-26T12:00:00Z" {
+		t.Fatalf("expected deleted_at preserved, got %#v", payload["deleted_at"])
+	}
+	if _, ok := payload["directory"]; ok {
+		t.Fatalf("expected canonical session delete payload without directory, got %#v", payload)
+	}
+}

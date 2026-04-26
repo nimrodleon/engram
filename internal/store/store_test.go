@@ -2233,6 +2233,82 @@ func TestApplyPulledMutationAcceptsStringifiedSessionPayload(t *testing.T) {
 	}
 }
 
+func TestApplyPulledSessionDeleteRemovesSessionAndPrompts(t *testing.T) {
+	s := newTestStore(t)
+
+	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "remote-delete", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`, "prompt-remote-delete", "remote-delete", "prompt", "engram"); err != nil {
+		t.Fatalf("seed prompt: %v", err)
+	}
+
+	mutation := SyncMutation{
+		Seq:       2,
+		TargetKey: DefaultSyncTargetKey,
+		Entity:    SyncEntitySession,
+		EntityKey: "remote-delete",
+		Op:        SyncOpDelete,
+		Payload:   `{"id":"remote-delete","project":"engram","deleted_at":"2026-04-26T10:00:00Z"}`,
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, mutation); err != nil {
+		t.Fatalf("apply pulled session delete: %v", err)
+	}
+
+	if _, err := s.GetSession("remote-delete"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected session to be deleted by pulled mutation, got err=%v", err)
+	}
+	var promptCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM user_prompts WHERE session_id = ?`, "remote-delete").Scan(&promptCount); err != nil {
+		t.Fatalf("count prompts: %v", err)
+	}
+	if promptCount != 0 {
+		t.Fatalf("expected pulled session delete to remove prompts, got %d", promptCount)
+	}
+
+	pending, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
+	if err != nil {
+		t.Fatalf("list pending after pulled session delete: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("expected pulled session delete not to enqueue local mutations, got %+v", pending)
+	}
+}
+
+func TestApplyPulledSessionUpsertTombstoneRemovesSessionAndPrompts(t *testing.T) {
+	s := newTestStore(t)
+
+	if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "remote-tombstone", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`, "prompt-remote-tombstone", "remote-tombstone", "prompt", "engram"); err != nil {
+		t.Fatalf("seed prompt: %v", err)
+	}
+
+	mutation := SyncMutation{
+		Seq:       3,
+		TargetKey: DefaultSyncTargetKey,
+		Entity:    SyncEntitySession,
+		EntityKey: "remote-tombstone",
+		Op:        SyncOpUpsert,
+		Payload:   `{"id":"remote-tombstone","project":"engram","deleted_at":"2026-04-26T11:00:00Z"}`,
+	}
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, mutation); err != nil {
+		t.Fatalf("apply pulled upsert tombstone: %v", err)
+	}
+
+	if _, err := s.GetSession("remote-tombstone"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected session removed by upsert tombstone, got err=%v", err)
+	}
+	var promptCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM user_prompts WHERE session_id = ?`, "remote-tombstone").Scan(&promptCount); err != nil {
+		t.Fatalf("count prompts: %v", err)
+	}
+	if promptCount != 0 {
+		t.Fatalf("expected upsert tombstone to remove prompts, got %d", promptCount)
+	}
+}
+
 func TestSessionSyncPayloadPreservesStartedAtOnApply(t *testing.T) {
 	s := newTestStore(t)
 
@@ -6038,7 +6114,7 @@ func TestDeleteSession_EmptySession(t *testing.T) {
 	}
 }
 
-func TestDeleteSession_BlockedWhenProjectEnrolledForCloudSync(t *testing.T) {
+func TestDeleteSession_EnrolledProjectEnqueuesSyncDeleteMutation(t *testing.T) {
 	s := newTestStore(t)
 
 	if err := s.CreateSession("sess-enrolled", "proj", "/tmp"); err != nil {
@@ -6055,9 +6131,8 @@ func TestDeleteSession_BlockedWhenProjectEnrolledForCloudSync(t *testing.T) {
 		t.Fatalf("enroll project: %v", err)
 	}
 
-	err := s.DeleteSession("sess-enrolled")
-	if !errors.Is(err, ErrSessionDeleteBlocked) {
-		t.Fatalf("expected ErrSessionDeleteBlocked, got: %v", err)
+	if err := s.DeleteSession("sess-enrolled"); err != nil {
+		t.Fatalf("delete session: %v", err)
 	}
 
 	sessions, err := s.RecentSessions("proj", 10)
@@ -6071,16 +6146,41 @@ func TestDeleteSession_BlockedWhenProjectEnrolledForCloudSync(t *testing.T) {
 			break
 		}
 	}
-	if !found {
-		t.Fatal("expected enrolled session to remain after blocked delete")
+	if found {
+		t.Fatal("expected enrolled session to be deleted")
 	}
 
 	prompts, err := s.RecentPrompts("proj", 10)
 	if err != nil {
 		t.Fatalf("recent prompts: %v", err)
 	}
-	if len(prompts) != 1 {
-		t.Fatalf("expected prompt rows to remain after blocked delete, got %d", len(prompts))
+	if len(prompts) != 0 {
+		t.Fatalf("expected prompt rows to be removed with enrolled delete, got %d", len(prompts))
+	}
+
+	mutations, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
+	if err != nil {
+		t.Fatalf("list pending mutations: %v", err)
+	}
+	if len(mutations) == 0 {
+		t.Fatal("expected session delete mutation to be enqueued")
+	}
+	last := mutations[len(mutations)-1]
+	if last.Entity != SyncEntitySession || last.EntityKey != "sess-enrolled" || last.Op != SyncOpDelete {
+		t.Fatalf("expected final mutation session/delete for sess-enrolled, got %+v", last)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(last.Payload), &payload); err != nil {
+		t.Fatalf("decode session delete payload: %v", err)
+	}
+	if payload["id"] != "sess-enrolled" {
+		t.Fatalf("expected delete payload id sess-enrolled, got %#v", payload["id"])
+	}
+	if payload["project"] != "proj" {
+		t.Fatalf("expected delete payload project proj, got %#v", payload["project"])
+	}
+	if _, ok := payload["deleted_at"]; !ok {
+		t.Fatalf("expected delete payload to include deleted_at, got %#v", payload)
 	}
 }
 

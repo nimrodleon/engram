@@ -453,6 +453,49 @@ func TestBuildDashboardReadModelUsesStableChunkIDOrderForEqualTimestamps(t *test
 	}
 }
 
+func TestBuildDashboardReadModelRemovesSessionOnUpsertTombstone(t *testing.T) {
+	chunks := []dashboardChunkRow{
+		{
+			project:   "proj-tombstone",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 25, 9, 0, 0, 0, time.UTC),
+			parsed: engramsync.ChunkData{Mutations: []store.SyncMutation{{
+				Entity:    store.SyncEntitySession,
+				EntityKey: "s-tomb",
+				Op:        store.SyncOpUpsert,
+				Payload:   `{"id":"s-tomb","project":"proj-tombstone","started_at":"2026-04-25T09:00:00Z"}`,
+			}}},
+		},
+		{
+			project:   "proj-tombstone",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 25, 10, 0, 0, 0, time.UTC),
+			parsed: engramsync.ChunkData{Mutations: []store.SyncMutation{{
+				Entity:    store.SyncEntitySession,
+				EntityKey: "s-tomb",
+				Op:        store.SyncOpUpsert,
+				Payload:   `{"id":"s-tomb","project":"proj-tombstone","deleted_at":"2026-04-25T10:00:00Z"}`,
+			}}},
+		},
+	}
+
+	model, err := buildDashboardReadModel(chunks)
+	if err != nil {
+		t.Fatalf("build dashboard read model: %v", err)
+	}
+
+	detail := model.projectDetails["proj-tombstone"]
+	if len(detail.Sessions) != 0 {
+		t.Fatalf("expected upsert tombstone to remove session from detail list, got %+v", detail.Sessions)
+	}
+	if detail.Stats.Sessions != 0 {
+		t.Fatalf("expected upsert tombstone to remove session from stats, got %d", detail.Stats.Sessions)
+	}
+	if got := model.filterSessions("proj-tombstone", ""); len(got) != 0 {
+		t.Fatalf("expected browser sessions to omit tombstoned session, got %+v", got)
+	}
+}
+
 func TestBuildDashboardReadModelFailsOnMalformedMutationPayload(t *testing.T) {
 	_, err := buildDashboardReadModel([]dashboardChunkRow{{
 		chunkID:   "bad-chunk",

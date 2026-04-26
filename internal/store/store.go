@@ -284,12 +284,15 @@ type EnrolledProject struct {
 }
 
 type syncSessionPayload struct {
-	ID        string  `json:"id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	StartedAt string  `json:"started_at,omitempty"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
+	ID         string  `json:"id"`
+	Project    string  `json:"project"`
+	Directory  string  `json:"directory,omitempty"`
+	StartedAt  string  `json:"started_at,omitempty"`
+	EndedAt    *string `json:"ended_at,omitempty"`
+	Summary    *string `json:"summary,omitempty"`
+	Deleted    bool    `json:"deleted,omitempty"`
+	DeletedAt  *string `json:"deleted_at,omitempty"`
+	HardDelete bool    `json:"hard_delete,omitempty"`
 }
 
 type syncObservationPayload struct {
@@ -1266,7 +1269,7 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		return blocked(UpgradeReasonBlockedLegacyMutationManual, "legacy mutation payload is empty"), nil
 	}
 
-	supported := (entity == SyncEntitySession && op == SyncOpUpsert) ||
+	supported := (entity == SyncEntitySession && (op == SyncOpUpsert || op == SyncOpDelete)) ||
 		((entity == SyncEntityObservation || entity == SyncEntityPrompt) && (op == SyncOpUpsert || op == SyncOpDelete))
 	if !supported {
 		return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("unsupported legacy mutation %q/%q", entity, op)), nil
@@ -1291,7 +1294,7 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		if strings.TrimSpace(mutation.EntityKey) != "" && strings.TrimSpace(mutation.EntityKey) != body.ID {
 			return blocked(UpgradeReasonBlockedLegacyMutationManual, fmt.Sprintf("session entity_key %q does not match payload id %q", mutation.EntityKey, body.ID)), nil
 		}
-		if body.Directory == "" {
+		if op == SyncOpUpsert && body.Directory == "" {
 			var directory string
 			err := tx.QueryRow(`SELECT ifnull(directory, '') FROM sessions WHERE id = ?`, body.ID).Scan(&directory)
 			if errors.Is(err, sql.ErrNoRows) || strings.TrimSpace(directory) == "" {
@@ -1310,7 +1313,7 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		if err != nil {
 			return cloudUpgradeLegacyMutationEvaluation{}, err
 		}
-		return repairable("session payload is missing required upsert fields", "repair fills session id/directory from local sessions table", string(encoded)), nil
+		return repairable("session payload is missing required fields", "repair fills session id/directory from local sessions table", string(encoded)), nil
 
 	case SyncEntityObservation:
 		var body syncObservationPayload
@@ -2092,14 +2095,10 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 // DeleteSession hard-deletes a session and its prompts.
 // It returns ErrSessionHasObservations if the session has any observations
 // (including soft-deleted ones) to prevent orphaned rows.
-// It returns ErrSessionDeleteBlocked when the session's project is currently
-// enrolled for cloud sync, to avoid local-only deletes diverging from cloud state.
 // It returns ErrSessionNotFound if no session with that ID exists.
 //
-// Note: this delete only removes local rows. It does not enqueue a delete
-// sync mutation, but any previously enqueued mutations for the session or its
-// prompts may still be synced later if autosync is enabled, and a later pull
-// may recreate the deleted rows locally.
+// When the session belongs to an enrolled project, this operation also enqueues
+// a session/delete mutation so cloud replicas can remove the session.
 func (s *Store) DeleteSession(id string) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		var project string
@@ -2116,10 +2115,6 @@ func (s *Store) DeleteSession(id string) error {
 				return fmt.Errorf("delete session: check enrollment: %w", err)
 			}
 		}
-		if enrolled == 1 {
-			return fmt.Errorf("%w: session %q belongs to enrolled project %q", ErrSessionDeleteBlocked, id, project)
-		}
-
 		// Count ALL observations for the session, including soft-deleted ones,
 		// because the FK constraint on observations.session_id has no ON DELETE CASCADE.
 		var count int
@@ -2156,6 +2151,17 @@ func (s *Store) DeleteSession(id string) error {
 		}
 		if n == 0 {
 			return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
+		}
+
+		if enrolled == 1 {
+			now := Now()
+			if err := s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpDelete, syncSessionPayload{
+				ID:        id,
+				Project:   project,
+				DeletedAt: &now,
+			}); err != nil {
+				return fmt.Errorf("delete session: enqueue mutation: %w", err)
+			}
 		}
 
 		return nil
@@ -4496,6 +4502,12 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 		if err := decodeSyncPayload([]byte(mutation.Payload), &payload); err != nil {
 			return err
 		}
+		if strings.TrimSpace(payload.ID) == "" {
+			payload.ID = strings.TrimSpace(mutation.EntityKey)
+		}
+		if mutation.Op == SyncOpDelete || isSessionDeletePayload(payload) {
+			return s.applySessionDeleteTx(tx, payload)
+		}
 		return s.applySessionPayloadTx(tx, payload)
 	case SyncEntityObservation:
 		var payload syncObservationPayload
@@ -4617,6 +4629,9 @@ func observationPayloadFromObservation(obs *Observation) syncObservationPayload 
 }
 
 func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) error {
+	if isSessionDeletePayload(payload) {
+		return s.applySessionDeleteTx(tx, payload)
+	}
 	_, err := s.execHook(tx,
 		`INSERT INTO sessions (id, project, directory, started_at, ended_at, summary)
 		 VALUES (?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')), ?, ?)
@@ -4628,6 +4643,28 @@ func (s *Store) applySessionPayloadTx(tx *sql.Tx, payload syncSessionPayload) er
 		   summary = COALESCE(excluded.summary, sessions.summary)`,
 		payload.ID, payload.Project, payload.Directory, strings.TrimSpace(payload.StartedAt), payload.EndedAt, payload.Summary,
 	)
+	return err
+}
+
+func isSessionDeletePayload(payload syncSessionPayload) bool {
+	if payload.Deleted || payload.HardDelete {
+		return true
+	}
+	if payload.DeletedAt == nil {
+		return false
+	}
+	return strings.TrimSpace(*payload.DeletedAt) != ""
+}
+
+func (s *Store) applySessionDeleteTx(tx *sql.Tx, payload syncSessionPayload) error {
+	sessionID := strings.TrimSpace(payload.ID)
+	if sessionID == "" {
+		return nil
+	}
+	if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE session_id = ?`, sessionID); err != nil {
+		return err
+	}
+	_, err := s.execHook(tx, `DELETE FROM sessions WHERE id = ?`, sessionID)
 	return err
 }
 
